@@ -16,7 +16,8 @@ use url::Url;
 use uv_cache::{ArchiveId, CacheBucket, CacheEntry, WheelCache};
 use uv_cache_info::{CacheInfo, Timestamp};
 use uv_client::{
-    CacheControl, CachedClientError, Connectivity, DataWithCachePolicy, RegistryClient,
+    CacheControl, CachedClientError, Connectivity, DataWithCachePolicy,
+    ErrorKind as ClientErrorKind, RegistryClient,
 };
 use uv_distribution_filename::WheelFilename;
 use uv_distribution_types::{
@@ -37,7 +38,7 @@ use uv_types::{BuildContext, BuildStack};
 
 use crate::archive::Archive;
 use crate::error::PythonVersion;
-use crate::hash::http_hash_algorithms;
+use crate::hash::ArtifactHashPolicy;
 use crate::metadata::{ArchiveMetadata, Metadata};
 use crate::source::SourceDistributionBuilder;
 use crate::{Error, LocalWheel, Reporter, RequiresDist};
@@ -194,16 +195,30 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         match dist {
             BuiltDist::Registry(wheels) => {
                 let wheel = wheels.best_wheel();
+                let route = self.client.unmanaged.routes().route_for(&wheel.index);
                 let WheelTarget {
                     url,
                     extension,
                     size,
                 } = WheelTarget::try_from(&*wheel.file)?;
+                let hashes = if route.is_proxy() {
+                    let cache_verification = if wheel.file.hashes.is_empty() {
+                        hashes
+                    } else {
+                        HashPolicy::Any(wheel.file.hashes.as_slice())
+                    };
+                    ArtifactHashPolicy::new(hashes, cache_verification)
+                } else {
+                    ArtifactHashPolicy::from(hashes)
+                };
+                let url = route
+                    .to_proxy_url(&url)
+                    .map_err(|error| Error::Client(ClientErrorKind::ProxyIndex(error).into()))?;
 
                 // Create a cache entry for the wheel.
                 let wheel_entry = self.build_context.cache().entry(
                     CacheBucket::Wheels,
-                    WheelCache::Index(&wheel.index).wheel_dir(wheel.name().as_ref()),
+                    WheelCache::Index(route.effective_url()).wheel_dir(wheel.name().as_ref()),
                     wheel.filename.cache_key(),
                 );
 
@@ -219,7 +234,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                             WheelExtension::Whl,
                             wheel_entry,
                             dist,
-                            hashes,
+                            hashes.required,
                         )
                         .await;
                 }
@@ -228,7 +243,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 match self
                     .stream_wheel(
                         url.clone(),
-                        dist.index(),
+                        Some(route.effective_url()),
                         &wheel.filename,
                         extension,
                         size,
@@ -266,7 +281,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                         let archive = self
                             .download_wheel(
                                 url,
-                                dist.index(),
+                                Some(route.effective_url()),
                                 &wheel.filename,
                                 extension,
                                 size,
@@ -311,7 +326,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                         wheel.size,
                         &wheel_entry,
                         dist,
-                        hashes,
+                        hashes.into(),
                     )
                     .await
                 {
@@ -349,7 +364,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                                 wheel.size,
                                 &wheel_entry,
                                 dist,
-                                hashes,
+                                hashes.into(),
                             )
                             .await?;
                         Ok(LocalWheel {
@@ -683,7 +698,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         size: Option<u64>,
         wheel_entry: &CacheEntry,
         dist: &BuiltDist,
-        hashes: HashPolicy<'_>,
+        hashes: ArtifactHashPolicy<'_>,
     ) -> Result<Archive, Error> {
         let expected_size = match dist {
             BuiltDist::Registry(dist) if dist.best_wheel().size_is_authoritative => size,
@@ -718,7 +733,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                     .into_async_read();
 
                 // Create a hasher for each hash algorithm.
-                let algorithms = http_hash_algorithms(hashes);
+                let algorithms = hashes.http_algorithms();
                 let mut hashers = algorithms.into_iter().map(Hasher::from).collect::<Vec<_>>();
                 let mut hasher = uv_extract::hash::HashReader::new(reader.compat(), &mut hashers);
 
@@ -774,6 +789,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                         actual: actual_size,
                     });
                 }
+                let computed_hashes = validate_hashes(hashers, hashes, dist)?;
 
                 // Before we make the wheel accessible by persisting it, ensure that the RECORD is
                 // valid.
@@ -790,7 +806,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
 
                 Ok(Archive::new(
                     id,
-                    hashers.into_iter().map(HashDigest::from).collect(),
+                    computed_hashes.into(),
                     filename.clone(),
                     Some(actual_size),
                 ))
@@ -849,7 +865,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
 
         // If the archive is missing the required hashes or size, or has since been removed, force a refresh.
         let archive = Some(archive)
-            .filter(|archive| archive.has_digests(hashes))
+            .filter(|archive| hashes.admits_cached_artifact(archive))
             .filter(|archive| archive.exists(self.build_context.cache()))
             .filter(|archive| expected_size.is_none() || archive.size.is_some());
 
@@ -888,7 +904,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         size: Option<u64>,
         wheel_entry: &CacheEntry,
         dist: &BuiltDist,
-        hashes: HashPolicy<'_>,
+        hashes: ArtifactHashPolicy<'_>,
     ) -> Result<Archive, Error> {
         let expected_size = match dist {
             BuiltDist::Registry(dist) if dist.best_wheel().size_is_authoritative => size,
@@ -923,7 +939,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                     .bytes_stream()
                     .map_err(|err| self.handle_response_errors(err))
                     .into_async_read();
-                let algorithms = http_hash_algorithms(hashes);
+                let algorithms = hashes.http_algorithms();
                 let mut hashers = algorithms.into_iter().map(Hasher::from).collect::<Vec<_>>();
                 let mut hasher = uv_extract::hash::HashReader::new(reader.compat(), &mut hashers);
 
@@ -993,7 +1009,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                         ExtractedWheelManifest::without_tree(files)
                     }
                 };
-                let hashes = hashers.into_iter().map(HashDigest::from).collect();
+                let computed_hashes = validate_hashes(hashers, hashes, dist)?;
 
                 // Before we make the wheel accessible by persisting it, ensure that the RECORD is
                 // valid.
@@ -1010,7 +1026,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
 
                 Ok(Archive::new(
                     id,
-                    hashes,
+                    computed_hashes.into(),
                     filename.clone(),
                     Some(actual_size),
                 ))
@@ -1069,7 +1085,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
 
         // If the archive is missing the required hashes or size, or has since been removed, force a refresh.
         let archive = Some(archive)
-            .filter(|archive| archive.has_digests(hashes))
+            .filter(|archive| hashes.admits_cached_artifact(archive))
             .filter(|archive| archive.exists(self.build_context.cache()))
             .filter(|archive| expected_size.is_none() || archive.size.is_some());
 
@@ -1604,6 +1620,19 @@ enum WheelExtension {
     Whl,
     /// A `.whl.tar.zst` file.
     WhlZst,
+}
+
+fn validate_hashes(
+    hashers: Vec<Hasher>,
+    hashes: ArtifactHashPolicy<'_>,
+    dist: &BuiltDist,
+) -> Result<Vec<HashDigest>, Error> {
+    let computed_hashes = hashers
+        .into_iter()
+        .map(HashDigest::from)
+        .collect::<Vec<_>>();
+    hashes.validate_download(dist, &computed_hashes)?;
+    Ok(computed_hashes)
 }
 
 /// Add `.tar.zst` to the end of the URL path, if it doesn't already exist.
