@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::future::Future;
 use std::io;
@@ -21,8 +22,8 @@ use uv_client::{
 };
 use uv_distribution_filename::WheelFilename;
 use uv_distribution_types::{
-    BuildInfo, BuildableSource, BuiltDist, Dist, DistRef, File, HashPolicy, Hashed, IndexUrl,
-    InstalledDist, Name, SourceDist, ToUrlError,
+    BuildInfo, BuildableSource, BuiltDist, CanonicalArtifactUrl, Dist, DistRef, HashPolicy, Hashed,
+    IndexUrl, InstalledDist, Name, RegistryFile, SourceDist, ToUrlError,
 };
 use uv_extract::dirhash::{DirectoryDigest, DirhashTree, dirhash_path};
 use uv_extract::hash::Hasher;
@@ -202,7 +203,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                     .proxy_route_for(&wheel.index);
                 let index = route.map_or(&wheel.index, |route| route.effective_url());
                 let WheelTarget {
-                    mut url,
+                    url,
                     extension,
                     size,
                 } = WheelTarget::try_from(&*wheel.file)?;
@@ -216,11 +217,13 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 } else {
                     ArtifactHashPolicy::from(hashes)
                 };
-                if let Some(route) = route {
-                    url = route.to_proxy_url(&url).map_err(|error| {
-                        Error::Client(ClientErrorKind::ProxyIndex(error).into())
-                    })?;
-                }
+                let url = if let Some(route) = route {
+                    route
+                        .artifact_url_for_request(&url)
+                        .map_err(|error| Error::Client(ClientErrorKind::ProxyIndex(error).into()))?
+                } else {
+                    url.to_url()?
+                };
 
                 // Create a cache entry for the wheel.
                 let wheel_entry = self.build_context.cache().entry(
@@ -1590,30 +1593,31 @@ impl PathArchivePointer {
 }
 
 #[derive(Debug, Clone)]
-struct WheelTarget {
+struct WheelTarget<'a> {
     /// The URL from which the wheel can be downloaded.
-    url: DisplaySafeUrl,
+    url: Cow<'a, CanonicalArtifactUrl>,
     /// The expected extension of the wheel file.
     extension: WheelExtension,
     /// The expected size of the wheel file, if known.
     size: Option<u64>,
 }
 
-impl TryFrom<&File> for WheelTarget {
+impl<'a> TryFrom<&'a RegistryFile> for WheelTarget<'a> {
     type Error = ToUrlError;
 
-    /// Determine the [`WheelTarget`] from a [`File`].
-    fn try_from(file: &File) -> Result<Self, Self::Error> {
-        let url = file.url.to_url()?;
+    /// Determine the [`WheelTarget`] from a canonical registry file.
+    fn try_from(file: &'a RegistryFile) -> Result<Self, Self::Error> {
         if let Some(zstd) = file.zstd.as_ref() {
             Ok(Self {
-                url: add_tar_zst_extension(url),
+                url: Cow::Owned(CanonicalArtifactUrl::from_url(add_tar_zst_extension(
+                    file.url.to_url()?,
+                ))),
                 extension: WheelExtension::WhlZst,
                 size: zstd.size,
             })
         } else {
             Ok(Self {
-                url,
+                url: Cow::Borrowed(&file.url),
                 extension: WheelExtension::Whl,
                 size: file.size,
             })
